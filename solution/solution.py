@@ -1,7 +1,11 @@
 """
 Knowledge system that knows what's true now (and what was true then).
-Step 2: keep every version of every page.
+Steps 2-6: page history, page trust, chunking, snapshot-aware search, Claude answer writer.
 """
+import hashlib
+import json
+import math
+import os
 import re
 import sys
 from collections import defaultdict
@@ -10,8 +14,6 @@ from pathlib import Path
 sys.path.insert(0, str(next(d / "harness" for d in Path(__file__).resolve().parents
                             if (d / "harness" / "contract.py").exists())))
 from contract import Answer, Conflict, Snapshot, Source  # noqa: E402
-
-WORD = re.compile(r"[a-z0-9$%.]+")
 
 # ---------------- Page trust: who to believe when pages disagree ----------------
 
@@ -161,9 +163,94 @@ def question_date(q):
 def normalize_q(q):
     return " ".join(sorted(set(tokens(q))))
 
-import hashlib
-import math
+# ---------------- Step 6: Claude writes the answer ----------------
 
+SYSTEM_PROMPT = """You are Dupaco Community Credit Union's member assistant. You answer ONLY from the
+evidence excerpts provided (pages from the credit union's own website, as downloaded on a given date).
+
+Decide what is true like a careful human expert:
+1. Authority: the OFFICIAL RATE SHEET and official product pages beat calculators, promo/landing pages,
+   uploaded documents, blog posts and press releases. Calculators and old posts often show stale numbers.
+2. Recency: prefer the most recent "effective as of" date; a dated news/blog post describes the past.
+   For facts like counts (branches, members) or awards, use the most recent dated statement.
+3. Tiers are not conflicts: term, balance, loan amount, model year, personal vs business, standard vs
+   jumbo, intro vs standard APR, rate vs APY are DIFFERENT facts. Pick the tier the question asks for.
+   If no tier is given, lead with the standard/base tier (smallest balance or loan-amount tier that
+   applies broadly) and name it. For "what are all X" questions list every item.
+4. Honesty: if the evidence does not state the answer (e.g. a product or branch is not mentioned, or a
+   rate is not published), say "I don't know - that isn't listed on our website; please contact us."
+   and include NO numbers at all. Never guess or borrow a number from a different product.
+
+Style: 1-3 short sentences. Include ONLY the numbers that answer the question. Never mention an old,
+stale, or other-tier number, not even to say it is wrong. Quote URLs exactly if the question asks for a
+link. Do not ask the member for more information before answering; answer, then optionally ask which
+branch/tier they mean.
+
+Return ONLY a JSON object:
+{"answer": "<member-facing text>", "evidence": [<ids of excerpts you used, best first>],
+ "confident": true|false, "conflict_note": "<if sources disagreed, which you chose and why, else null>"}"""
+
+
+class LLMWriter:
+    @staticmethod
+    def create():
+        if os.getenv("KS_DISABLE_LLM") or not os.getenv("ANTHROPIC_API_KEY"):
+            return None
+        try:
+            import anthropic
+            return LLMWriter(anthropic.Anthropic(max_retries=2, timeout=25))
+        except Exception:
+            return None
+
+    def __init__(self, client):
+        self.client = client
+        self.model = os.getenv("KS_MODEL", "claude-haiku-5-5")
+
+    def answer(self, question, hits, snap_date, snap_id, historical):
+        parts = []
+        for i, (_, c) in enumerate(hits, 1):
+            meta = [KIND_LABEL[c.kind]]
+            if c.pdate:
+                meta.append(f"published {c.pdate}")
+            if c.eff:
+                meta.append("rates effective " + ", ".join(c.eff))
+            parts.append(f"[{i}] {c.url}  ({'; '.join(meta)})\nTitle: {c.title}\n"
+                         f"Section: {c.heading}\n{c.text[:1800]}")
+        when = (f"Answer as the website stood on {snap_date} (historical question)." if historical
+                else f"Answer with what is current as of the newest download ({snap_date}).")
+        user = f"{when}\n\nEVIDENCE:\n\n" + "\n\n---\n\n".join(parts) + f"\n\nQUESTION: {question}"
+        try:
+            resp = self.client.messages.create(
+                model=self.model, max_tokens=400, temperature=0, system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user}])
+            raw = "".join(getattr(b, "text", "") for b in resp.content)
+            data = json.loads(re.search(r"\{.*\}", raw, re.S).group(0))
+        except Exception as e:
+            print("LLM error:", e, file=sys.stderr)
+            return None
+        text = str(data.get("answer", "")).strip()
+        if not text:
+            return None
+        ids = [int(x) for x in data.get("evidence", []) if str(x).isdigit() and 1 <= int(x) <= len(hits)]
+        confident = bool(data.get("confident", True))
+        sources = []
+        if confident:
+            # cite what Claude used, plus other trusted pages that state the same numbers
+            nums = set(re.findall(r"\d+(?:\.\d+)?%?", text))
+            extra = [i for i in range(1, len(hits) + 1) if i not in ids
+                     and TRUST[hits[i - 1][1].kind] >= 0.9
+                     and nums & set(re.findall(r"\d+(?:\.\d+)?%?", hits[i - 1][1].text))]
+            seen = set()
+            for i in list(dict.fromkeys(ids)) + extra:
+                c = hits[i - 1][1]
+                if c.url not in seen:
+                    seen.add(c.url)
+                    sources.append(Source(url=c.url, snapshot_id=snap_id, quote=c.text[:200]))
+            sources = sources[:4]
+        return Answer(text=text, sources=sources, confident=confident,
+                      conflict_note=data.get("conflict_note") or None)
+
+# ---------------- The knowledge system ----------------
 
 class Chunk:
     __slots__ = ("cid", "url", "title", "heading", "text", "snaps", "kind", "is_table", "pdate", "eff")
@@ -184,6 +271,7 @@ class TemporalKnowledge:
         self.postings = defaultdict(list)    # word -> [(chunk id, count)]
         self.doc_len = []
         self.cache = {}
+        self.llm = LLMWriter.create()        # None when no API key -> fallback answers
 
     # ---------------- ingest ----------------
     def ingest(self, snapshot: Snapshot) -> None:
@@ -282,24 +370,36 @@ class TemporalKnowledge:
                 break
         return out
 
-    # ---------------- answer: placeholder until Step 6 ----------------
+    # ---------------- answer ----------------
     def answer(self, question, as_of=None):
         date = as_of or question_date(question)
         if date and date >= self.snapshots[-1][0]:
             date = None                                  # a future/today date = newest snapshot
         idx = self.snapshot_for(date)
+        key = (normalize_q(question), idx)
+        if key in self.cache:                            # same question -> same answer
+            return self.cache[key]
         if idx is None:
-            return Answer(text="I don't have information from that far back (our records start with "
-                               "the first website download). Please contact us.", confident=False)
-        hits = self.search(question, idx)
-        if not hits:
-            return Answer(text="I don't know - that isn't listed on our website; please contact us.",
-                          confident=False)
-        c = hits[0][1]
-        return Answer(text=c.text[:400], sources=[Source(url=c.url, snapshot_id=self.snapshots[idx][1])])
+            ans = Answer(text="I don't have information from that far back (our records start with "
+                              "the first website download). Please contact us.", confident=False)
+        else:
+            hits = self.search(question, idx)
+            snap_date, snap_id = self.snapshots[idx]
+            ans = None
+            if self.llm and hits:
+                ans = self.llm.answer(question, hits, snap_date, snap_id, historical=date is not None)
+            if ans is None:                              # no key / API error: simple fallback
+                ans = (Answer(text=hits[0][1].text[:400],
+                              sources=[Source(url=hits[0][1].url, snapshot_id=snap_id)])
+                       if hits else Answer(text="I don't know - that isn't listed on our website; "
+                                                "please contact us.", confident=False))
+        self.cache[key] = ans
+        return ans
 
+    # ---------------- conflicts: Step 8 ----------------
     def conflicts(self):
         return []
+
 
 def build():
     return TemporalKnowledge()
