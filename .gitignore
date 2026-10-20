@@ -10,3 +10,4 @@ snapshots_zip/
 snapshots/
 *.pdf
 results/
+.venv/

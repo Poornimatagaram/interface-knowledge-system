@@ -221,13 +221,28 @@ class LLMWriter:
         user = f"{when}\n\nEVIDENCE:\n\n" + "\n\n---\n\n".join(parts) + f"\n\nQUESTION: {question}"
         try:
             resp = self.client.messages.create(
-                model=self.model, max_tokens=400, temperature=0, system=SYSTEM_PROMPT,
+                model=self.model, max_tokens=1500, system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": user}])
-            raw = "".join(getattr(b, "text", "") for b in resp.content)
-            data = json.loads(re.search(r"\{.*\}", raw, re.S).group(0))
         except Exception as e:
             print("LLM error:", e, file=sys.stderr)
             return None
+        raw = "".join(getattr(b, "text", "") for b in resp.content).strip()
+        m = re.search(r"\{.*\}", raw, re.S)
+        try:
+            data = json.loads(m.group(0)) if m else None
+        except Exception:
+            data = None
+        if data is None:
+            # rescue: pull the answer field out of broken JSON, or use the plain text
+            print(f"LLM parse issue (stop_reason={resp.stop_reason}): {raw[:120]!r}", file=sys.stderr)
+            a = re.search(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)', raw)
+            text = a.group(1) if a else re.sub(r"^```\w*|```$", "", raw).strip()
+            if not text:
+                return None
+            ids = [int(x) for x in re.findall(r"\d+", (re.search(r'"evidence"\s*:\s*\[([^\]]*)', raw)
+                                                       or re.search("()", "")).group(1))]
+            refused = bool(re.search(r"don't know|isn't listed|not listed|contact us", text, re.I))
+            data = {"answer": text, "evidence": ids, "confident": not refused}
         text = str(data.get("answer", "")).strip()
         if not text:
             return None
