@@ -1,0 +1,12 @@
+results/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+snapshots/0*/
+
+# never publish the credit union's data or the assignment
+snapshots_zip/
+snapshots/
+*.pdf
+results/
