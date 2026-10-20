@@ -218,7 +218,7 @@ class LLMWriter:
         self.client = client
         self.model = os.getenv("KS_MODEL", "claude-haiku-5-5")
 
-    def answer(self, question, hits, snap_date, snap_id, historical):
+    def answer(self, question, hits, snap_date, snap_id, historical, facts=None):
         parts = []
         for i, (_, c) in enumerate(hits, 1):
             meta = [KIND_LABEL[c.kind]]
@@ -230,7 +230,13 @@ class LLMWriter:
                          f"Section: {c.heading}\n{c.text[:1800]}")
         when = (f"Answer as the website stood on {snap_date} (historical question)." if historical
                 else f"Answer with what is current as of the newest download ({snap_date}).")
-        user = f"{when}\n\nEVIDENCE:\n\n" + "\n\n---\n\n".join(parts) + f"\n\nQUESTION: {question}"
+        verified = ""
+        if facts:   # contradictions already resolved at ingest time (see conflicts())
+            verified = ("VERIFIED FACTS (resolved from contradictions across the site; use these over "
+                        "older statements):\n" + "\n".join(f"- {f}" for f in facts) + "\n\n")
+        user = (f"{when}\n\n{verified}EVIDENCE:\n\n" + "\n\n---\n\n".join(parts)
+                + f"\n\nQUESTION: {question}")
+
         try:
             resp = self.client.messages.create(
                 model=self.model, max_tokens=1500, system=SYSTEM_PROMPT,
@@ -552,7 +558,9 @@ class TemporalKnowledge:
             snap_date, snap_id = self.snapshots[idx]
             ans = None
             if self.llm and hits:
-                ans = self.llm.answer(question, hits, snap_date, snap_id, historical=date is not None)
+                facts = None if date else self.verified_facts(question)
+                ans = self.llm.answer(question, hits, snap_date, snap_id,
+                                      historical=date is not None, facts=facts)
             if ans is None:                              # no key / API error: simple fallback
                 ans = (Answer(text=hits[0][1].text[:400],
                               sources=[Source(url=hits[0][1].url, snapshot_id=snap_id)])
@@ -560,6 +568,13 @@ class TemporalKnowledge:
                                                 "please contact us.", confident=False))
         self.cache[key] = ans
         return ans
+
+    def verified_facts(self, question):
+        """Prose facts that conflict resolution already settled (e.g. the branch count), for questions
+        that mention them. Retrieval struggles here because the number sits in boilerplate text."""
+        qt = set(tokens(question))
+        return [f"{c.topic}: {c.resolution} ({c.reason})" for c in self.conflicts()
+                if c.reason.startswith("most recent dated statement") and qt & set(tokens(c.topic))]
 
     # ---------------- conflicts: Step 8 ----------------
     def conflicts(self):
