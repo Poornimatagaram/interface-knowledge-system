@@ -44,6 +44,72 @@ KIND_LABEL = {"rate_sheet": "OFFICIAL RATE SHEET", "official": "official product
               "document": "uploaded document (may be old)", "calculator": "calculator (often stale)",
               "news_blog": "news/blog post (dated; describes the past)"}
 
+# ---------------- Cleaning, dates, chunking ----------------
+
+MONTHS = {m: i + 1 for i, m in enumerate(
+    "january february march april may june july august september october november december".split())}
+MDY = re.compile(r"\b(" + "|".join(MONTHS) + r")\.?\s+(\d{1,2}),?\s+(20\d\d)\b", re.I)
+EFFECTIVE = re.compile(r"effective as of (\d{1,2})/(\d{1,2})/(\d{4})", re.I)
+
+
+def clean_markdown(md: str) -> str:
+    md = md.replace("\\\\r\\\\n", " ").replace("\\r\\n", " ")
+    md = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", md)                        # drop images
+    md = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r"\1 (\2)", md)  # keep link text + url
+    md = re.sub(r"[ \t]+", " ", md)
+    return re.sub(r"\n{3,}", "\n\n", md)
+
+
+def page_date(md: str):
+    """Publish date near the top of a news/blog post, e.g. 'June 07, 2022' -> '2022-06-07'."""
+    m = MDY.search(md[:600])
+    return f"{m.group(3)}-{MONTHS[m.group(1).lower()]:02d}-{int(m.group(2)):02d}" if m else None
+
+
+def effective_dates(text: str):
+    return sorted({f"{y}-{int(m):02d}-{int(d):02d}" for m, d, y in EFFECTIVE.findall(text)})
+
+
+MAX_CHARS = 900
+
+
+def chunk_page(md: str):
+    """Split a page into [(heading, body)]. Tables stay whole with their heading."""
+    blocks = [b.strip() for b in md.split("\n\n") if b.strip()]
+    out, heading, buf, recent_short = [], "", [], []
+
+    def flush():
+        if buf:
+            out.append((heading, "\n\n".join(buf)))
+            buf.clear()
+
+    for b in blocks:
+        if b.startswith("#"):                              # a heading starts a new section
+            flush()
+            heading = b.lstrip("#").strip()[:120]
+            recent_short = []
+            continue
+        if b.startswith("|"):                              # a table: keep it whole
+            flush()
+            label = " / ".join(recent_short[-2:])          # short lines above = table name
+            rows = b.split("\n")
+            head, body = rows[:2], rows[2:]
+            for i in range(0, max(1, len(body)), 30):      # split only very long tables
+                out.append((f"{heading} | {label}".strip(" |"), "\n".join(head + body[i:i + 30])))
+            continue
+        if len(b) < 70 and "\n" not in b and not b.endswith("."):
+            recent_short.append(b)
+        if sum(len(x) for x in buf) + len(b) > MAX_CHARS:
+            flush()
+        buf.append(b)
+        # the footnote right under a table ("Rates are effective as of...") belongs to that table
+        if out and out[-1][1].startswith("|") and len(buf) == 1 and \
+                ("effective" in b.lower() or b[:1].isdigit()):
+            h, t = out[-1]
+            out[-1] = (h, t + "\n\n" + b[:400])
+    flush()
+    return out
+
 class TemporalKnowledge:
     def __init__(self):
         self.snapshots = []                    # [(taken_on, snapshot_id)], oldest first
