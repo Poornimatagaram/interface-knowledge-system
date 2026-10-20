@@ -1,0 +1,7 @@
+[
+  {"id": "c-auto60", "topic_keywords": ["auto", "60"], "values": ["5.34%", "5.39%"], "correct_value": "5.39%"},
+  {"id": "c-auto84", "topic_keywords": ["auto", "84"], "values": ["5.54%", "5.59%"], "correct_value": "5.59%"},
+  {"id": "c-mort30", "topic_keywords": ["30-year"], "values": ["6.037%", "7.29%"], "correct_value": "7.29%"},
+  {"id": "c-checking", "topic_keywords": ["checking"], "values": ["3.00%", "2.50%"], "correct_value": "2.50%"},
+  {"id": "c-branches", "topic_keywords": ["branch"], "values": ["24 branch", "22 branch"], "correct_value": "22 branch"}
+]
