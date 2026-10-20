@@ -277,6 +277,141 @@ class LLMWriter:
         return Answer(text=text, sources=sources, confident=confident,
                       conflict_note=data.get("conflict_note") or None)
 
+# ---------------- Step 8: conflicts from "fact cards" ----------------
+
+PCT = re.compile(r"(\d+\.\d+)\s*%")
+YEAR_RANGE = re.compile(r"\b(20\d\d|19\d\d)\s*(?:[-–]\s*(\d{2,4}))?\s*model year", re.I)
+
+
+def _norm_label(x):
+    x = re.sub(r"(\d),(\d)", r"\1\2", x.lower()).replace("–", "-")
+    return re.sub(r"\s+", " ", re.sub(r"\d+$", "", x.strip())).strip()   # drop footnote digits
+
+
+def table_facts(chunk):
+    """Turn each table row into fact cards: ((row labels, column type), value).
+    Model-year ranges become a rank ('model-year tier #1' = newest), because when the year rolls
+    over the site relabels 2023-26 -> 2024-27, and a stale page still shows the old label + old rate."""
+    lines = [l for l in chunk.text.split("\n") if l.startswith("|")]
+    if len(lines) < 3:
+        return
+    heads = [h.strip().lower() for h in lines[0].strip("|").split("|")]
+    rows = [[x.strip() for x in r.strip("|").split("|")] for r in lines[2:]]
+    has_apy = any("apy" in h or "yield" in h for h in heads)
+    years = sorted({int(m.group(1)) for r in rows for c in r for m in [YEAR_RANGE.search(c)] if m},
+                   reverse=True)
+    for cells in rows:
+        labels = []
+        for c in cells:
+            if not c or PCT.search(c) or re.fullmatch(r"\$?[\d,.]+", c.replace(" ", "")):
+                continue
+            m = YEAR_RANGE.search(c)
+            labels.append(f"model-year tier #{years.index(int(m.group(1))) + 1}" if m else _norm_label(c))
+        label = " | ".join(labels)[:140]
+        if not label:
+            continue
+        for h, v in zip(heads, cells):
+            m = PCT.search(v)
+            if not m:
+                continue
+            if has_apy and "dividend" in h:
+                continue                     # APY is the member-facing number; skip the twin column
+            col = ("apy" if ("apy" in h or "yield" in h) else
+                   "apr" if ("apr" in h or "annual percentage rate" in h) else
+                   "dividend rate" if "dividend" in h else "rate")
+            yield (label, col), float(m.group(1))
+
+
+def fmt(v):
+    s = f"{v:.3f}".rstrip("0")
+    return (s + "0" if s.endswith(".") or len(s.split(".")[1]) < 2 else s) + "%"
+
+
+def find_conflicts(ks):
+    """Two kinds of contradiction, merged per fact:
+    (a) STALE COPY: in the newest snapshot, different pages show different values for the same fact
+        (and no single page shows both, so tiers on one page are never flagged);
+    (b) CHANGED OVER TIME: a trusted page's value changed between snapshots, so older pages/answers
+        built on it are now wrong.
+    Winner: newest snapshot, then page trust, then latest effective date."""
+    n = len(ks.snapshots)
+    if not n:
+        return []
+    obs = defaultdict(list)                              # fact key -> [(value, snap, chunk)]
+    for c in ks.chunks:
+        if not c.is_table:
+            continue
+        for key, val in table_facts(c):
+            for i in range(n):
+                if c.snaps >> i & 1:
+                    obs[key].append((val, i, c))
+    out = []
+    for (label, col), xs in sorted(obs.items()):
+        latest = [(v, c) for v, i, c in xs if i == n - 1]
+        by_url = defaultdict(set)
+        for v, c in latest:
+            by_url[c.url].add(v)
+        stale = (len({v for v, _ in latest}) > 1 and len(by_url) > 1
+                 and all(len(vs) == 1 for vs in by_url.values()))
+        # (b) a trusted page whose value for this fact changed between snapshots
+        #     (one value per snapshot on that page, so tier rows are never mixed up)
+        timeline = None
+        for url in sorted({c.url for v, i, c in xs if TRUST[c.kind] >= 0.9}):
+            per = defaultdict(set)
+            for v, i, c in xs:
+                if c.url == url:
+                    per[i].add(v)
+            if all(len(vs) == 1 for vs in per.values()) and len({min(vs) for vs in per.values()}) > 1:
+                timeline = [(i, min(per[i])) for i in sorted(per)]
+                break
+        if not (stale or timeline):
+            continue
+        if stale:
+            wv, wc = max(latest, key=lambda vc: (TRUST[vc[1].kind], max(vc[1].eff or [""])))
+            losers = sorted({KIND_LABEL[c.kind] for v, c in latest if v != wv})
+            reason = f"{KIND_LABEL[wc.kind]} outranks {', '.join(losers)} in the newest snapshot"
+        else:
+            wv = timeline[-1][1]
+            wc = next(c for v, i, c in xs if v == wv and i == timeline[-1][0])
+            steps = [timeline[0]] + [t for k, t in enumerate(timeline[1:], 1) if t[1] != timeline[k - 1][1]]
+            hist = " -> ".join(f"{fmt(v)} ({ks.snapshots[i][0]})" for i, v in steps)
+            reason = f"value changed over time on {wc.url}: {hist}; the newest value wins"
+        heading = wc.heading.split("|")[-1].strip()
+        urls = sorted({c.url for v, i, c in xs})
+        out.append(Conflict(
+            topic=f"{heading} - {label} {col.upper()}".strip(" -"),
+            values=[fmt(v) for v in sorted({v for v, i, c in xs})],
+            sources=[Source(url=u) for u in urls[:6]],
+            resolution=fmt(wv), reason=reason))
+    out.extend(count_conflicts(ks))
+    return out
+
+
+COUNT = re.compile(r"\b(\d{1,3})\s+(branch office locations|branch locations|branches)\b", re.I)
+
+
+def count_conflicts(ks):
+    """Counts stated in prose (number of branches): the most recent dated statement wins."""
+    bit = 1 << (len(ks.snapshots) - 1)
+    dated = {}
+    for c in ks.chunks:
+        if not (c.snaps & bit) or not c.pdate:
+            continue
+        for m in COUNT.finditer(c.text):
+            v = int(m.group(1))
+            if 5 <= v <= 200 and (v not in dated or c.pdate > dated[v][0]):
+                dated[v] = (c.pdate, c.url)
+    if len(dated) < 2:
+        return []
+    win = max(dated, key=lambda v: dated[v])
+    return [Conflict(
+        topic="number of branches / branch office locations",
+        values=[f"{v} branch office locations" for v in sorted(dated)],
+        sources=[Source(url=dated[v][1]) for v in sorted(dated)],
+        resolution=f"{win} branch office locations",
+        reason=f"most recent dated statement ({dated[win][0]}); older press releases repeat the "
+               f"count from when they were written")]
+
 # ---------------- The knowledge system ----------------
 
 class Chunk:
@@ -299,6 +434,8 @@ class TemporalKnowledge:
         self.doc_len = []
         self.cache = {}
         self.llm = LLMWriter.create()        # None when no API key -> fallback answers
+        self._conflicts = None
+
 
     # ---------------- ingest ----------------
     def ingest(self, snapshot: Snapshot) -> None:
@@ -329,6 +466,7 @@ class TemporalKnowledge:
             for cid in self.page_chunks[key]:
                 self.chunks[cid].snaps |= bit        # mark: present in this snapshot
         self.cache.clear()
+        self._conflicts = None
 
     def _index(self, cid, text):
         tf = defaultdict(int)
@@ -425,7 +563,9 @@ class TemporalKnowledge:
 
     # ---------------- conflicts: Step 8 ----------------
     def conflicts(self):
-        return []
+        if self._conflicts is None:          # computed once, after all snapshots are in
+            self._conflicts = find_conflicts(self)
+        return self._conflicts
 
 
 def build():
