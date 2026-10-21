@@ -251,7 +251,7 @@ class LLMWriter:
                 print("LLM error:", e, file=sys.stderr)
                 return None
             args.pop("thinking", None)
-            args.pop("output_config", None)                 # model/SDK without that option: retry plainly
+            args.pop("output_config", None) # model/SDK without that option: retry plainly
             try:
                 resp = self.client.messages.create(**args)
             except Exception as e2:
